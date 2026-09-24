@@ -1,3 +1,4 @@
+import argparse
 import socket
 import time
 
@@ -15,18 +16,36 @@ ROBOT_IP = "192.168.57.2"
 # 0 = 负方向
 J1_DIRECTION = 1
 
-# 第一次测试最大只允许J1运动0.2°
-J1_MAX_DISTANCE_DEG = 0.2
+# 按已确认方案，J1正方向最多运动15°
+J1_MAX_DISTANCE_DEG = 15.0
 
-# 第一次测试使用极低速度和加速度
-J1_SPEED_PERCENT = 1.0
+# 采用师兄方案的角度和速度，保留较低加速度
+J1_SPEED_PERCENT = 20.0
 J1_ACCELERATION_PERCENT = 5.0
 
-# 监控时间。到达时间后会额外发送StopJOG
-MONITOR_SECONDS = 2.0
+# 最长监控时间；正常情况下到达目标角度后会提前停止
+MONITOR_SECONDS = 20.0
+TARGET_REACHED_RATIO = 0.95
+J1_REVERSE_TOLERANCE_DEG = 0.2
+J1_OVERSHOOT_TOLERANCE_DEG = 0.5
 
 # J2～J6允许的反馈波动
 OTHER_JOINT_TOLERANCE_DEG = 0.1
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description=(
+            "FR3 J1首次低速点动测试。默认只检查状态；"
+            "只有添加--execute才可能发送运动命令。"
+        ),
+    )
+    parser.add_argument(
+        "--execute",
+        action="store_true",
+        help="允许在人工确认后执行J1正方向15°点动",
+    )
+    return parser.parse_args()
 
 
 # ============================================================
@@ -70,25 +89,84 @@ def read_status(name, result):
 
 
 def validate_configuration():
-    """限制本程序只能进行低速、极小角度的J1测试。"""
+    """限制本程序只能进行已确认参数范围内的J1测试。"""
     if J1_DIRECTION not in (0, 1):
         raise RuntimeError(
             "J1_DIRECTION只能设置为0或1"
         )
 
-    if not (0.0 < J1_MAX_DISTANCE_DEG <= 0.2):
+    if not (0.0 < J1_MAX_DISTANCE_DEG <= 15.0):
         raise RuntimeError(
-            "首次测试的J1_MAX_DISTANCE_DEG必须在0～0.2°之间"
+            "J1_MAX_DISTANCE_DEG必须在0～15°之间"
         )
 
-    if not (0.0 < J1_SPEED_PERCENT <= 1.0):
+    if not (0.0 < J1_SPEED_PERCENT <= 20.0):
         raise RuntimeError(
-            "首次测试的J1_SPEED_PERCENT必须在0～1%之间"
+            "J1_SPEED_PERCENT必须在0～20%之间"
         )
 
     if not (0.0 < J1_ACCELERATION_PERCENT <= 5.0):
         raise RuntimeError(
             "首次测试的J1_ACCELERATION_PERCENT必须在0～5%之间"
+        )
+
+
+def read_and_check_realtime_state(
+    robot,
+    expected_mode,
+):
+    """检查实时状态帧中的模式和运动安全状态。"""
+    state = robot.robot_state_pkg
+
+    if isinstance(state, type):
+        raise RuntimeError(
+            "尚未收到有效的机器人实时状态帧"
+        )
+
+    state_timestamp = getattr(
+        robot,
+        "robot_state_pkg_timestamp",
+        None,
+    )
+
+    if state_timestamp is None:
+        raise RuntimeError(
+            "实时状态帧没有有效时间戳"
+        )
+
+    state_age_seconds = time.monotonic() - state_timestamp
+
+    realtime = {
+        "robot_mode": int(state.robot_mode),
+        "enable_state": "当前773字节状态帧不提供",
+        "motion_done": int(state.motion_done),
+        "collision_state": int(state.collisionState),
+        "state_age_seconds": round(state_age_seconds, 3),
+        "valid_frames": int(robot.robot_state_valid_count),
+        "invalid_frames": int(robot.robot_state_invalid_count),
+    }
+
+    print("实时安全状态：", realtime)
+
+    if realtime["robot_mode"] != expected_mode:
+        raise RuntimeError(
+            "机器人模式不符合预期："
+            f"期望{expected_mode}，实际{realtime['robot_mode']}"
+        )
+
+    if realtime["motion_done"] != 1:
+        raise RuntimeError(
+            "实时状态显示机器人尚未停止"
+        )
+
+    if realtime["collision_state"] != 0:
+        raise RuntimeError(
+            "实时状态显示机器人存在碰撞信号"
+        )
+
+    if state_age_seconds > 0.5:
+        raise RuntimeError(
+            "实时状态已经超过0.5秒没有更新，拒绝继续"
         )
 
 
@@ -169,10 +247,11 @@ def read_and_check_robot_state(robot):
 # 主程序
 # ============================================================
 
+arguments = parse_arguments()
+
 robot = None
-jog_active = False
-enabled_by_script = False
-mode_changed = False
+jog_stop_required = False
+enable_was_requested = False
 
 try:
     validate_configuration()
@@ -255,6 +334,10 @@ try:
     # --------------------------------------------------------
 
     joints_before = read_and_check_robot_state(robot)
+    read_and_check_realtime_state(
+        robot,
+        expected_mode=1,
+    )
 
     print()
     print("准备执行的唯一运动命令：")
@@ -271,6 +354,15 @@ try:
     print("J2～J6不会收到运动指令，但会跟随J1整体改变空间位置。")
     print()
 
+    if not arguments.execute:
+        print("只读检查通过。")
+        print("本次未提供--execute，不会切换模式、使能或运动。")
+        print(
+            "完成现场安全确认后，才可由操作者本人使用"
+            "--execute重新运行。"
+        )
+        raise SystemExit(0)
+
     confirmation = input(
         "确认机器人已经固定、整个回转区域无人、"
         "物理急停在手边后，输入 MOVE_J1："
@@ -281,30 +373,31 @@ try:
         raise SystemExit(0)
 
     # --------------------------------------------------------
-    # 切换模式、设置低速并使能
+    # 保持手动模式并使能
     # --------------------------------------------------------
 
-    require_zero(
-        "切换自动模式",
-        robot.Mode(0),
-    )
-    mode_changed = True
-
-    require_zero(
-        "设置全局速度",
-        robot.SetSpeed(1),
-    )
-
+    # 只要发送过使能请求，finally就会尝试下使能。
+    enable_was_requested = True
     require_zero(
         "机器人使能",
         robot.RobotEnable(1),
     )
-    enabled_by_script = True
 
-    time.sleep(1.0)
+    # V3.7.x官方示例在上使能后等待3秒。
+    time.sleep(3.0)
 
-    # 使能后再次检查状态，并使用最新关节角度作为基准
+    # 使能命令返回成功后，再确认无报警、仍为手动模式且静止。
+    # 这台控制器的773字节状态帧不包含独立使能反馈字段。
     joints_before = read_and_check_robot_state(robot)
+    read_and_check_realtime_state(
+        robot,
+        expected_mode=1,
+    )
+
+    require_zero(
+        "设置全局速度",
+        robot.SetSpeed(J1_SPEED_PERCENT),
+    )
 
     print("即将发送J1点动命令。")
 
@@ -312,12 +405,14 @@ try:
     # 唯一的运动指令：J1点动
     # --------------------------------------------------------
 
+    # 在调用前设置停止标志，避免命令已经到达但响应丢失时漏发停止。
+    jog_stop_required = True
     jog_result = robot.StartJOG(
         ref=0,                          # 关节坐标系
         nb=1,                           # 固定为J1
         dir=J1_DIRECTION,               # 0负方向，1正方向
-        max_dis=J1_MAX_DISTANCE_DEG,    # 最大0.2°
-        vel=J1_SPEED_PERCENT,           # 速度1%
+        max_dis=J1_MAX_DISTANCE_DEG,    # 最大15°
+        vel=J1_SPEED_PERCENT,           # 速度20%
         acc=J1_ACCELERATION_PERCENT,    # 加速度5%
     )
 
@@ -326,13 +421,13 @@ try:
         jog_result,
     )
 
-    jog_active = True
-
     # --------------------------------------------------------
-    # 运动期间监控J2～J6
+    # 运动期间监控J1目标以及J2～J6
     # --------------------------------------------------------
 
     monitor_deadline = time.monotonic() + MONITOR_SECONDS
+    next_progress_time = time.monotonic()
+    target_reached = False
 
     while time.monotonic() < monitor_deadline:
         current_joints = read_status(
@@ -359,18 +454,64 @@ try:
             for change in joint_changes[1:]
         ]
 
+        directed_j1_change = (
+            joint_changes[0]
+            if J1_DIRECTION == 1
+            else -joint_changes[0]
+        )
+
+        if directed_j1_change < -J1_REVERSE_TOLERANCE_DEG:
+            immediate_result = robot.ImmStopJOG()
+            jog_stop_required = False
+
+            raise RuntimeError(
+                "检测到J1向错误方向运动，"
+                f"已发送立即停止。变化量：{joint_changes[0]:.4f}°，"
+                f"停止返回值：{immediate_result}"
+            )
+
+        if (
+            directed_j1_change
+            > J1_MAX_DISTANCE_DEG + J1_OVERSHOOT_TOLERANCE_DEG
+        ):
+            immediate_result = robot.ImmStopJOG()
+            jog_stop_required = False
+
+            raise RuntimeError(
+                "检测到J1超过允许角度，"
+                f"已发送立即停止。变化量：{joint_changes[0]:.4f}°，"
+                f"停止返回值：{immediate_result}"
+            )
+
         if any(
             change > OTHER_JOINT_TOLERANCE_DEG
             for change in unexpected_changes
         ):
             immediate_result = robot.ImmStopJOG()
-            jog_active = False
+            jog_stop_required = False
 
             raise RuntimeError(
                 "检测到J2～J6角度变化超过允许值，"
                 f"已发送立即停止。变化量：{joint_changes}，"
                 f"停止返回值：{immediate_result}"
             )
+
+        current_time = time.monotonic()
+        if current_time >= next_progress_time:
+            print(
+                "J1当前变化："
+                f"{joint_changes[0]:.4f}° / "
+                f"目标{J1_MAX_DISTANCE_DEG:.1f}°"
+            )
+            next_progress_time = current_time + 0.5
+
+        if (
+            directed_j1_change
+            >= J1_MAX_DISTANCE_DEG * TARGET_REACHED_RATIO
+        ):
+            target_reached = True
+            print("J1已接近目标角度，准备减速停止。")
+            break
 
         time.sleep(0.05)
 
@@ -379,14 +520,14 @@ try:
 
     if stop_result != 0:
         immediate_result = robot.ImmStopJOG()
-        jog_active = False
+        jog_stop_required = False
 
         raise RuntimeError(
             f"StopJOG失败，错误码：{stop_result}；"
             f"ImmStopJOG返回值：{immediate_result}"
         )
 
-    jog_active = False
+    jog_stop_required = False
 
     time.sleep(0.5)
 
@@ -425,17 +566,24 @@ try:
     else:
         print("J2～J6未检测到明显角度变化。")
 
+    if not target_reached:
+        raise RuntimeError(
+            f"J1在{MONITOR_SECONDS:.1f}秒内未达到目标角度，"
+            "已停止本次测试"
+        )
+
     print("J1低速点动测试完成。")
 
 except KeyboardInterrupt:
     print("\n检测到Ctrl+C，发送JOG立即停止命令。")
 
-    if robot is not None:
+    if robot is not None and jog_stop_required:
         try:
             print(
                 "ImmStopJOG返回值：",
                 robot.ImmStopJOG(),
             )
+            jog_stop_required = False
         except Exception as stop_error:
             print("软件停止失败：", stop_error)
             print("请立即使用物理急停。")
@@ -446,24 +594,25 @@ except SystemExit:
 except Exception as error:
     print("程序停止：", error)
 
-    if robot is not None and jog_active:
+    if robot is not None and jog_stop_required:
         try:
             print(
                 "ImmStopJOG返回值：",
                 robot.ImmStopJOG(),
             )
+            jog_stop_required = False
         except Exception:
             print("软件停止失败，请使用物理急停。")
 
 finally:
     if robot is not None:
-        if jog_active:
+        if jog_stop_required:
             try:
                 robot.ImmStopJOG()
             except Exception:
                 pass
 
-        if enabled_by_script:
+        if enable_was_requested:
             try:
                 print(
                     "机器人下使能：",
@@ -471,15 +620,6 @@ finally:
                 )
             except Exception as disable_error:
                 print("机器人下使能异常：", disable_error)
-
-        if mode_changed:
-            try:
-                print(
-                    "切回手动模式：",
-                    robot.Mode(1),
-                )
-            except Exception as mode_error:
-                print("切回手动模式异常：", mode_error)
 
         try:
             # v2.0.8必须先设置退出标志，再关闭实时状态套接字，
